@@ -1,7 +1,9 @@
 /* Web folders: what an app needs to live at a web address and go on a phone's Home Screen.
    webFolder(html, info) -> {files: {name: text}, icons: [{name, size}]}   index.html, manifest.webmanifest, sw.js (+ icons to draw)
    iconPixels(size, code, accent) -> RGBA pixels of a bead-letter icon      (Node turns them into PNG with pngFrom; the page uses a canvas)
-   siteIndex(site, apps) -> the front page listing the apps
+   siteIconPixels(size, accent) -> RGBA pixels of the front page's icon: a 3 x 3 grid of beads (SITE_ICONS lists the files)
+   siteIndex(site, apps) -> the front page listing the apps (grouped under headings when site.sections is set)
+   groupApps(sections, apps) -> [{name, id, blurb, apps}] for those headings
    zip(files) -> a .zip (stored, not compressed) of [{name, data: Uint8Array}]
    Works for apps the generator made and for apps it didn't (FIG, BIG): those get the Home Screen helper added. */
 (function(root){
@@ -24,18 +26,29 @@ const FONT={A:'01110100011000111111100011000110001',B:'1111010001100011111010001
   Y:'10001100010101000100001000010000100',Z:'11111000010001000100010001000011111','0':'01110100011001110101110011000101110','1':'00100011000010000100001000010001110',
   '2':'01110100010000100010001000100011111','3':'11111000100010000010000011000101110','4':'00010001100101010010111110001000010','5':'11111100001111000001000011000101110',
   '6':'00110010001000011110100011000101110','7':'11111000010001000100010000100001000','8':'01110100011000101110100011000101110','9':'01110100011000101111000010001001100'};
-function iconPixels(size,code,accent){
-  const px=new Uint8ClampedArray(size*size*4),bg=rgbOf(accent),ink=rgbOf(inkFor(accent));
+function iconBase(size,accent){
+  const px=new Uint8ClampedArray(size*size*4),bg=rgbOf(accent);
   for(let i=0;i<size*size;i++){px[i*4]=bg[0];px[i*4+1]=bg[1];px[i*4+2]=bg[2];px[i*4+3]=255}
+  return px;
+}
+function bead(px,size,ink,cx,cy,R,H){   /* a bead: a disc with a hole, with soft edges */
+  for(let y=Math.max(0,Math.floor(cy-R-1));y<=Math.min(size-1,Math.ceil(cy+R+1));y++)for(let x=Math.max(0,Math.floor(cx-R-1));x<=Math.min(size-1,Math.ceil(cx+R+1));x++){
+    const d=Math.hypot(x+0.5-cx,y+0.5-cy),a=Math.max(0,Math.min(1,R+0.5-d))-Math.max(0,Math.min(1,H+0.5-d));if(a<=0)continue;
+    const k=(y*size+x)*4;for(let c=0;c<3;c++)px[k+c]=Math.round(px[k+c]*(1-a)+ink[c]*a)}
+}
+function iconPixels(size,code,accent){
+  const px=iconBase(size,accent),ink=rgbOf(inkFor(accent));
   const chars=String(code).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,4).split('').filter(c=>FONT[c]);
   if(!chars.length)return px;
   const cols=chars.length*6-1,cell=Math.min(size*0.74/cols,size*0.56/7),ox=(size-cols*cell)/2,oy=(size-7*cell)/2,R=0.47*cell,H=0.15*cell;
-  const dot=(cx,cy)=>{   /* a bead: a disc with a hole, with soft edges */
-    for(let y=Math.max(0,Math.floor(cy-R-1));y<=Math.min(size-1,Math.ceil(cy+R+1));y++)for(let x=Math.max(0,Math.floor(cx-R-1));x<=Math.min(size-1,Math.ceil(cx+R+1));x++){
-      const d=Math.hypot(x+0.5-cx,y+0.5-cy),a=Math.max(0,Math.min(1,R+0.5-d))-Math.max(0,Math.min(1,H+0.5-d));if(a<=0)continue;
-      const k=(y*size+x)*4;for(let c=0;c<3;c++)px[k+c]=Math.round(px[k+c]*(1-a)+ink[c]*a)}
-  };
-  chars.forEach((ch,i)=>{const f=FONT[ch];for(let r=0;r<7;r++)for(let c=0;c<5;c++)if(f[r*5+c]==='1')dot(ox+(i*6+c+0.5)*cell,oy+(r+0.5)*cell)});
+  chars.forEach((ch,i)=>{const f=FONT[ch];for(let r=0;r<7;r++)for(let c=0;c<5;c++)if(f[r*5+c]==='1')bead(px,size,ink,ox+(i*6+c+0.5)*cell,oy+(r+0.5)*cell,R,H)});
+  return px;
+}
+/* the front page's own icon, so it doesn't borrow an app's: nine beads in a 3 x 3 grid (the usual "apps" sign) on the
+   site's accent colour. It stays inside the middle 80% circle, so Android can crop it to any shape. */
+function siteIconPixels(size,accent){
+  const px=iconBase(size,accent),ink=rgbOf(inkFor(accent)),step=0.2*size,R=0.075*size,H=0.024*size;
+  for(let r=-1;r<=1;r++)for(let c=-1;c<=1;c++)bead(px,size,ink,size/2+c*step,size/2+r*step,R,H);
   return px;
 }
 /* ---------- PNG and ZIP, small and dependency-free (PNG compression comes from Node's zlib, passed in) ---------- */
@@ -117,13 +130,79 @@ self.addEventListener('fetch',e=>{
     icons:[{name:'icon-192.png',size:192},{name:'icon-512.png',size:512},{name:'apple-touch-icon.png',size:180}]};
 }
 
+/* ---------- sections: site.json can list "sections" ([{name, blurb}] or names) and give each app a "section" (a name, or a
+   list of names to show it in more than one). Returns [{name, id, blurb, apps}] in the sections' order, empty sections left
+   out, and apps with no known section last under "More Apps". With no sections listed it returns [] (one plain list). ---------- */
+const slug=s=>String(s).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'section';
+function groupApps(sections,apps){
+  const named=(sections||[]).map(s=>typeof s==='string'?{name:s}:s).filter(s=>s&&String(s.name||'').trim());
+  if(!named.length)return[];
+  const secsOf=a=>[].concat(a.section||[]).map(s=>String(s).trim()).filter(Boolean),known=new Set(named.map(s=>String(s.name).trim()));
+  const groups=named.map(s=>{const name=String(s.name).trim();return{name,id:slug(name),blurb:s.blurb||'',apps:apps.filter(a=>secsOf(a).includes(name))}});
+  const rest=apps.filter(a=>!secsOf(a).some(n=>known.has(n)));
+  if(rest.length)groups.push({name:'More Apps',id:'more-apps',blurb:'',apps:rest});
+  return groups.filter(g=>g.apps.length);
+}
+
 /* ---------- the front page that lists the apps ---------- */
 function siteIndex(site,apps,files){
   const css=files['core/core.css'];
-  const cards=apps.map(a=>`      <a class="app" href="${esc(a.folder)}/">
+  const cardsOf=list=>list.map(a=>`      <a class="app" href="${esc(a.folder)}/">
         <img src="${esc(a.folder)}/icon-192.png" alt="" width="64" height="64">
         <span><b>${esc(a.code)}: ${esc(a.name)}</b><span class="sub">${esc(a.tagline||'')}</span></span>
       </a>`).join('\n');
+  const groups=groupApps(site.sections,apps);
+  const listing=!groups.length?`  <nav class="list" aria-label="Apps">
+${cardsOf(apps)}
+  </nav>`:`  <nav class="jump" aria-label="Sections">
+${groups.map(g=>`    <a href="#${esc(g.id)}">${esc(g.name)} <span class="n">${g.apps.length}<span class="sr"> ${g.apps.length===1?'app':'apps'}</span></span></a>`).join('\n')}
+  </nav>
+${groups.map(g=>`  <section class="sec" id="${esc(g.id)}" aria-labelledby="h-${esc(g.id)}">
+    <h2 id="h-${esc(g.id)}">${esc(g.name)}</h2>${g.blurb?`\n    <p class="sub">${esc(g.blurb)}</p>`:''}
+    <div class="list">
+${cardsOf(g.apps)}
+    </div>
+  </section>`).join('\n')}`;
+  /* the Instructions button: one place for how to open an app and put it on a Home Screen, with the visitor's device
+     opened first. The steps and button pictures match what core/home.js shows inside each app. */
+  const ic=p=>`<span class="ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg></span>`;
+  const I={share:ic('<path d="M12 3v12M8 7l4-4 4 4"/><path d="M7 11H6v9h12v-9h-1"/>'),dots:ic('<circle cx="5.5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="18.5" cy="12" r="1.3" fill="currentColor"/>'),
+    plus:ic('<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8.5v7M8.5 12h7"/>'),kebab:ic('<circle cx="12" cy="5.5" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="18.5" r="1.3" fill="currentColor"/>'),
+    compass:ic('<circle cx="12" cy="12" r="8.5"/><path d="M15 9l-2 4-4 2 2-4z" fill="currentColor"/>'),info:ic('<circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r="1.1" fill="currentColor"/>')};
+  const help=`  <details class="howto" id="instructions">
+    <summary>${I.info}Instructions</summary>
+    <div class="howto-body group">
+      <p>Tap an app to open it. To keep one on your phone or tablet, add it to your Home Screen: it then opens like any other app, with its own icon, and works without a connection.</p>
+      <details class="dev" data-dev="ios">
+        <summary>iPhone or iPad</summary>
+        <ol>
+          <li>Open the app in <b>Safari</b>. If the link opened inside Messages, Mail, Gmail or another app, tap ${I.dots} or ${I.compass} and choose <b>Open in Safari</b> first.</li>
+          <li>Tap ${I.share} <b>Share</b>. No Share button? Tap ${I.dots} first. On an iPad, it’s at the top right.</li>
+          <li>Tap ${I.plus} <b>Add to Home Screen</b>. You may need to scroll down to see it.</li>
+          <li>Tap <b>Add</b>.</li>
+        </ol>
+        <p class="sub">Best done before you start: on an iPhone or iPad, the Home Screen app keeps its own copy of your work, separate from Safari’s.</p>
+      </details>
+      <details class="dev" data-dev="android">
+        <summary>Android</summary>
+        <ol>
+          <li>Open the app in <b>Chrome</b>. If the link opened inside another app, tap ${I.kebab} and choose <b>Open in Chrome</b> first.</li>
+          <li>Tap ${I.kebab} (top right).</li>
+          <li>Tap <b>Add to Home screen</b> or <b>Install app</b>.</li>
+          <li>Tap <b>Install</b> or <b>Add</b>.</li>
+        </ol>
+        <p class="sub">If the app shows an <b>Install</b> button at the bottom, tapping it does the same.</p>
+      </details>
+      <details class="dev" data-dev="computer">
+        <summary>Computer</summary>
+        <ol>
+          <li>Open the app and bookmark it.</li>
+          <li>In Chrome or Edge you can also install it as an app, from the browser’s menu.</li>
+        </ol>
+      </details>
+      <p class="sub">On a phone, each app also shows the steps for that phone the first time it opens. Everything runs on your device: pictures and work you make are never uploaded. When an app is updated, you get the new version the next time you open it online.</p>
+    </div>
+  </details>`;
   return`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -131,7 +210,9 @@ function siteIndex(site,apps,files){
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="${esc(site.accent)}">
 <title>${esc(site.title)}</title>
-<link rel="icon" href="${esc(apps[0]?apps[0].folder+'/icon-192.png':'')}">
+<link rel="icon" href="icon-192.png" sizes="192x192">
+<link rel="icon" href="icon-512.png" sizes="512x512">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>
 ${css.trim()}
 :root{--accent:${site.accent};--accent-ink:${inkFor(site.accent)}}
@@ -139,7 +220,29 @@ ${css.trim()}
 .app{display:grid;grid-template-columns:64px minmax(0,1fr);gap:14px;align-items:center;padding:14px;border:1px solid var(--line);border-radius:16px;background:var(--panel);color:var(--ink);text-decoration:none;min-height:44px}
 .app img{border-radius:14px}.app b{display:block;font-size:17px;margin-bottom:2px}
 .app:hover,.app:focus-visible{border-color:var(--accent)}
-.how{max-width:760px;margin:18px auto 0;padding:0 16px}
+.app:focus-visible,.jump a:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.jump{display:flex;flex-wrap:wrap;gap:8px;max-width:760px;margin:6px auto 4px;padding:0 16px}
+.jump a{display:inline-flex;align-items:center;gap:8px;min-height:44px;padding:0 14px;border:1px solid var(--line);border-radius:999px;background:var(--chip);color:var(--ink);text-decoration:none;font-size:15px}
+.jump a:hover{border-color:var(--accent)}
+.jump .n{display:inline-block;min-width:22px;padding:0 6px;border-radius:999px;background:var(--panel);color:var(--muted);font-size:13px;line-height:22px;text-align:center}
+.sec{max-width:760px;margin:22px auto 0;padding:0}
+.sec>h2,.sec>.sub{padding:0 16px}.sec>.sub{margin:-4px 0 10px}
+.sec>h2{margin-bottom:6px}
+.ic{display:inline-flex;vertical-align:-5px;width:22px;height:22px;margin:0 2px}.ic svg{width:100%;height:100%}
+.howto{max-width:760px;margin:10px auto 4px;padding:0 16px}
+.howto>summary{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 18px 0 12px;border-radius:999px;background:var(--accent);color:var(--accent-ink);font-weight:650;cursor:pointer;list-style:none}
+.howto>summary::-webkit-details-marker,.dev>summary::-webkit-details-marker{display:none}
+.howto>summary::after{content:"";width:8px;height:8px;margin-left:6px;border:solid currentColor;border-width:0 2px 2px 0;transform:rotate(45deg) translate(-2px,-2px)}
+.howto[open]>summary::after{transform:rotate(-135deg) translate(-2px,-2px)}
+.howto-body{margin-top:10px}.howto-body>p:first-child{margin-top:0}.howto[open]{margin-bottom:14px}
+.dev{border:1px solid var(--line);border-radius:12px;margin:8px 0;background:var(--bg)}
+.dev>summary{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 14px;font-weight:650;cursor:pointer;list-style:none}
+.dev>summary::before{content:"";width:7px;height:7px;border:solid currentColor;border-width:0 2px 2px 0;transform:rotate(-45deg);margin-right:4px;flex:none}
+.dev[open]>summary::before{transform:rotate(45deg)}
+.dev .this{font-weight:400;font-size:13px;color:var(--muted);margin-left:auto}
+.dev ol{margin:0;padding:0 14px 4px 36px}.dev li{margin:6px 0}.dev>.sub{padding:0 14px 12px}
+.howto summary:focus-visible,.more a:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.more{max-width:760px;margin:22px auto 0;padding:0 16px}.more a{display:inline-flex;align-items:center;min-height:44px;color:var(--ink)}
 header,.foot{max-width:760px}
 </style>
 </head>
@@ -149,26 +252,30 @@ header,.foot{max-width:760px}
   <p>${esc(site.tagline)}</p>
 </header>
 <main>
-  <nav class="list" aria-label="Apps">
-${cards}
-  </nav>
-  <section class="how group">
-    <h2>Put an App on Your Phone or Tablet</h2>
-    <ol class="sub">
-      <li>Tap an app above to open it.</li>
-      <li>A card at the bottom shows the two or three taps for your phone. On an iPhone or iPad: <b>Share</b>, then <b>Add to Home Screen</b>, then <b>Add</b>.</li>
-      <li>Open it from your Home Screen from then on. It works without a connection once it has opened once.</li>
-    </ol>
-    <p class="sub">Everything runs in your browser. Pictures and work you make stay on your device.</p>
-  </section>
+${help}
+${listing}
+  <p class="more"><a href="#instructions">How to put an app on your phone or tablet</a></p>
 </main>
 <p class="foot">${esc(site.foot||'')}</p>
+<script>
+(function(){
+  /* open the steps for this device, and open Instructions when a link goes to it */
+  var u=navigator.userAgent,ios=/iPad|iPhone|iPod/.test(u)||(/Macintosh/.test(u)&&navigator.maxTouchPoints>1);
+  var d=document.querySelector('.dev[data-dev="'+(ios?'ios':/Android/.test(u)?'android':'computer')+'"]');
+  if(d){d.open=true;d.querySelector('summary').insertAdjacentHTML('beforeend','<span class="this">This device</span>')}
+  var h=document.getElementById('instructions');
+  function show(){if(location.hash==='#instructions')h.open=true}
+  window.addEventListener('hashchange',show);show();
+  document.querySelectorAll('a[href="#instructions"]').forEach(function(a){a.addEventListener('click',function(){h.open=true})});
+})();
+</script>
 </body>
 </html>
 `;
 }
 
-const api={iconPixels,pngFrom,zip,crc32,webFolder,siteIndex,infoOf,inkFor,HOME_JS_NAME};
+const SITE_ICONS=[{name:'icon-192.png',size:192},{name:'icon-512.png',size:512},{name:'apple-touch-icon.png',size:180}];
+const api={iconPixels,siteIconPixels,SITE_ICONS,pngFrom,zip,crc32,webFolder,siteIndex,groupApps,infoOf,inkFor,HOME_JS_NAME};
 root.AppWeb=api;
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 })(typeof window!=='undefined'?window:globalThis);
